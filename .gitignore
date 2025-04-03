@@ -1,0 +1,15 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.log
+*.txt
+*.bin
+*.mp3
+*.wav
+*.m4a
+bin/
+whisper.cpp/
+.env
+.idea/
+.vscode/
+
