@@ -12,4 +12,5 @@ whisper.cpp/
 .env
 .idea/
 .vscode/
+*.venv*
 
