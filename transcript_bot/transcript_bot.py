@@ -1,17 +1,18 @@
 import asyncio
+import io
 import json
 import os
 import tempfile
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import discord
 import discord.sinks
 from discord.ext import commands
-from discord import app_commands
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 import ollama as ollama_client
@@ -30,7 +31,7 @@ logger = logging.getLogger("transcript_bot")
 # Environment / Config
 # -------------------------------------------------
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
@@ -51,6 +52,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 CHARACTERS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "characters")
+CHUNK_INTERVAL = int(os.getenv("CHUNK_INTERVAL", "60"))  # seconds between mid-session transcription passes
 
 
 def parse_guild_ids(raw: str) -> List[int]:
@@ -100,6 +102,39 @@ def save_character_map(guild_id: int, mapping: Dict[int, str]) -> None:
         json.dump({str(k): v for k, v in mapping.items()}, f, indent=2)
 
 # -------------------------------------------------
+# Custom sink with drainable pending buffer
+# -------------------------------------------------
+
+class ChunkedWaveSink(discord.sinks.WaveSink):
+    """WaveSink that maintains a separate thread-safe drainable buffer
+    so the background task can pull audio in chunks without touching
+    the main audio_data that discord.py manages."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._pending: Dict[int, io.BytesIO] = {}
+
+    def write(self, data: bytes, user: int) -> None:
+        with self._lock:
+            if user not in self._pending:
+                self._pending[user] = io.BytesIO()
+            self._pending[user].write(data)
+        super().write(data, user)
+
+    def drain_pending(self) -> Dict[int, bytes]:
+        """Atomically return all pending audio bytes per user and reset the buffer."""
+        with self._lock:
+            result: Dict[int, bytes] = {}
+            for user_id, buf in self._pending.items():
+                buf.seek(0)
+                data = buf.read()
+                if data:
+                    result[user_id] = data
+            self._pending.clear()
+            return result
+
+# -------------------------------------------------
 # Session / State dataclasses
 # -------------------------------------------------
 
@@ -109,8 +144,13 @@ class VoiceSession:
     voice_client: discord.VoiceClient
     text_channel_id: int
     started_by_id: int
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
     active: bool = True
+    voice_channel_name: Optional[str] = None
+    # Incremental transcription state
+    transcript_chunks: Dict[int, List[str]] = field(default_factory=dict)
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    chunk_task: Optional[asyncio.Task] = field(default=None)
 
 
 class VoiceSessionManager:
@@ -170,30 +210,16 @@ intents.message_content = True
 
 class TranscriptBot(commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self) -> None:
-        if GUILD_IDS:
-            logger.info("Syncing application commands to guilds: %s", GUILD_IDS)
-            for gid in GUILD_IDS:
-                guild = discord.Object(id=gid)
-                try:
-                    self.tree.copy_global_to(guild=guild)
-                    synced = await self.tree.sync(guild=guild)
-                    logger.info("Synced %d commands to guild %d.", len(synced), gid)
-                except Exception:
-                    logger.exception("Failed to sync commands for guild %d", gid)
-        else:
-            logger.info("Syncing global application commands.")
-            try:
-                synced = await self.tree.sync()
-                logger.info("Synced %d global commands.", len(synced))
-            except Exception:
-                logger.exception("Failed to sync global commands")
+        super().__init__(command_prefix="!", intents=intents, auto_sync_commands=True)
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         logger.info("Connected to %d guild(s).", len(self.guilds))
+        if GUILD_IDS:
+            # Purge any stale globally-registered commands so guild commands are the only ones visible.
+            await self.http.bulk_upsert_global_commands(self.application_id, [])
+            logger.info("Cleared global application commands.")
+        await self.sync_commands(delete_existing=True)
 
 
 bot = TranscriptBot()
@@ -214,7 +240,7 @@ async def transcribe_wav(wav_path: str) -> str:
 
 
 async def convert_to_16k_mono(raw_bytes: bytes) -> str:
-    """Write raw WAV bytes to disk, resample to 16 kHz mono, return output path."""
+    """Resample a WAV file (bytes) to 16 kHz mono, return output path."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as src:
         src.write(raw_bytes)
         src_path = src.name
@@ -230,21 +256,96 @@ async def convert_to_16k_mono(raw_bytes: bytes) -> str:
     os.unlink(src_path)
     return dst_path
 
+
+async def convert_pcm_to_16k_mono(pcm_bytes: bytes) -> str:
+    """Resample raw 48 kHz stereo s16le PCM (from Discord) to 16 kHz mono WAV."""
+    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as src:
+        src.write(pcm_bytes)
+        src_path = src.name
+
+    dst_path = src_path.replace(".raw", "_16k.wav")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y",
+        "-f", "s16le", "-ar", "48000", "-ac", "2",
+        "-i", src_path,
+        "-ar", "16000", "-ac", "1",
+        dst_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    os.unlink(src_path)
+    return dst_path
+
+# -------------------------------------------------
+# Incremental (chunked) transcription
+# -------------------------------------------------
+
+async def transcribe_pending_chunk(guild_id: int, sink: ChunkedWaveSink, session: VoiceSession) -> None:
+    """Drain the sink's pending buffer and transcribe each user's audio in parallel."""
+    pending = sink.drain_pending()
+    if not pending:
+        return
+
+    async def process_user(user_id: int, raw: bytes) -> None:
+        if not raw:
+            return
+        logger.info("Transcribing chunk for user %d: %d bytes of PCM", user_id, len(raw))
+        try:
+            wav_16k_path = await convert_pcm_to_16k_mono(raw)
+            text = await transcribe_wav(wav_16k_path)
+            os.unlink(wav_16k_path)
+        except Exception as e:
+            logger.exception("Chunk transcription failed for user %d: %s", user_id, e)
+            return
+        if text:
+            session.transcript_chunks.setdefault(user_id, []).append(text)
+            logger.info("Chunk transcribed for user %d: %d chars", user_id, len(text))
+        else:
+            logger.info("Chunk for user %d produced no text (silence?)", user_id)
+
+    await asyncio.gather(*(process_user(uid, raw) for uid, raw in pending.items()))
+
+
+async def periodic_transcription(
+    guild_id: int, sink: ChunkedWaveSink, stop_event: asyncio.Event
+) -> None:
+    """Background task: every CHUNK_INTERVAL seconds, drain and transcribe pending audio.
+    When stop_event is set, do one final pass and exit."""
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=CHUNK_INTERVAL)
+            # stop_event fired — do final transcription then exit
+            session = voice_sessions.get(guild_id)
+            if session:
+                await transcribe_pending_chunk(guild_id, sink, session)
+            return
+        except asyncio.TimeoutError:
+            pass  # normal interval elapsed
+
+        session = voice_sessions.get(guild_id)
+        if not session or not session.active:
+            return
+        await transcribe_pending_chunk(guild_id, sink, session)
+
 # -------------------------------------------------
 # Ollama summary
 # -------------------------------------------------
 
 async def generate_summary(transcript_text: str, session_info: str) -> str:
     prompt = (
-        "You are a dungeon master's scribe summarizing a Dungeons & Dragons session. "
-        "Based on the following transcript, write a narrative summary that covers:\n"
-        "- What happened in the session (key plot points)\n"
-        "- Important decisions the players made\n"
-        "- Notable moments, encounters, or role-play highlights\n"
-        "- Any unresolved threads or cliffhangers\n\n"
+        "You are a dungeon master's scribe. Summarize ONLY what is explicitly said in the transcript below. "
+        "Do NOT invent, infer, or add anything that is not directly stated. "
+        "Do NOT fill in missing details or imagine what might have happened. "
+        "If the transcript contains very little content, write a brief, honest summary of only what was said — even if that is just a sentence or two. "
+        "Only include a section if the transcript actually contains relevant content for it:\n"
+        "- Key events or plot points mentioned\n"
+        "- Decisions or plans the players discussed\n"
+        "- Notable moments or role-play that occurred\n"
+        "- Unresolved questions raised in the conversation\n\n"
         f"Session info: {session_info}\n\n"
         f"Transcript:\n{transcript_text}\n\n"
-        "Summary:"
+        "Summary (based strictly on the transcript above):"
     )
     try:
         client = ollama_client.AsyncClient(host=OLLAMA_HOST)
@@ -285,8 +386,8 @@ async def save_transcript_file(
     duration_min = int((ended_at - started_at).total_seconds() // 60)
     header = (
         f"# {CAMPAIGN_NAME} — Session {date_str}\n\n"
-        f"**Started:** {started_at.strftime('%Y-%m-%d %H:%M UTC')}  \n"
-        f"**Ended:** {ended_at.strftime('%Y-%m-%d %H:%M UTC')}  \n"
+        f"**Started:** {started_at.strftime('%Y-%m-%d %H:%M %Z')}  \n"
+        f"**Ended:** {ended_at.strftime('%Y-%m-%d %H:%M %Z')}  \n"
         f"**Duration:** ~{duration_min} min  \n"
         f"**Participants:** {', '.join(participants)}\n\n"
     )
@@ -320,6 +421,11 @@ async def git_push_transcript(filepath: str) -> None:
             logger.warning("git %s: %s", args[1], stderr.decode().strip())
         return proc.returncode
 
+    rc = await run("git", "pull", "--rebase")
+    if rc != 0:
+        logger.error("git pull --rebase failed for '%s' — aborting rebase, skipping push.", filename)
+        await run("git", "rebase", "--abort")
+        return
     await run("git", "add", filepath)
     rc = await run("git", "commit", "-m", f"Add transcript: {filename}")
     if rc != 0:
@@ -354,55 +460,47 @@ async def post_chunked(channel: discord.TextChannel, text: str, limit: int = 190
 # Recording finished handler
 # -------------------------------------------------
 
-async def handle_recording_finished(guild_id: int, sink: discord.sinks.Sink) -> None:
-    ended_at = datetime.now(timezone.utc)
+async def handle_recording_finished(guild_id: int, sink: ChunkedWaveSink) -> None:
+    ended_at = datetime.now().astimezone()
     session = voice_sessions.get(guild_id)
     if not session:
         return
+
+    # Signal the chunk task to do one final drain+transcribe, then wait for it.
+    session.stop_event.set()
+    if session.chunk_task and not session.chunk_task.done():
+        try:
+            await asyncio.wait_for(session.chunk_task, timeout=600)
+        except asyncio.TimeoutError:
+            logger.warning("Final chunk transcription timed out — transcript may be incomplete.")
 
     guild = bot.get_guild(guild_id)
     text_channel = guild.get_channel(session.text_channel_id) if guild else None
     if text_channel is None:
         return
 
-    await text_channel.send("Recording ended. Transcribing audio — this may take a few minutes...")
+    await text_channel.send("Recording ended. Building transcript...")
 
     transcript_lines: List[str] = []
     participants: List[str] = []
 
-    for user_id, audio_list in sink.audio_data.items():
+    # audio_data keys cover every user who spoke, even if their last chunk is already in transcript_chunks
+    all_user_ids = set(session.transcript_chunks.keys()) | set(sink.audio_data.keys())
+    for user_id in all_user_ids:
         member = guild.get_member(user_id) if guild else None
         discord_name = member.display_name if member else f"User {user_id}"
         char_name = session_manager.get_character(guild_id, user_id)
         speaker_label = f"{char_name} ({discord_name})" if char_name else discord_name
         participants.append(speaker_label)
 
-        combined_bytes = b""
-        for audio in audio_list:
-            audio.file.seek(0)
-            combined_bytes += audio.file.read()
-
-        if not combined_bytes:
-            transcript_lines.append(f"**{speaker_label}**: [no audio]")
-            continue
-
-        try:
-            wav_16k_path = await convert_to_16k_mono(combined_bytes)
-            text = await transcribe_wav(wav_16k_path)
-            os.unlink(wav_16k_path)
-        except Exception as e:
-            logger.exception("Transcription failed for %s: %s", speaker_label, e)
-            text = f"[transcription error: {e}]"
-
+        chunks = session.transcript_chunks.get(user_id, [])
+        text = " ".join(chunks) if chunks else "[no audio]"
         transcript_lines.append(f"**{speaker_label}**: {text}")
 
     full_transcript = "\n\n".join(transcript_lines)
     await post_chunked(text_channel, "**Transcript:**\n\n" + full_transcript)
 
-    voice_channel = None
-    if guild and session.voice_client:
-        voice_channel = session.voice_client.channel
-    vc_name = voice_channel.name if voice_channel else "unknown"
+    vc_name = session.voice_channel_name or "unknown"
 
     summary_channel = None
     if SUMMARY_CHANNEL_ID and guild:
@@ -437,70 +535,56 @@ async def handle_recording_finished(guild_id: int, sink: discord.sinks.Sink) -> 
         )
         await placeholder.edit(content=summary_msg[:2000])
 
-    if session.voice_client and session.voice_client.is_connected():
-        await session.voice_client.disconnect(force=True)
 
 # -------------------------------------------------
 # Slash commands
 # -------------------------------------------------
 
-@bot.tree.command(name="ping", description="Check if the bot is alive.")
-async def ping(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message("Pong.", ephemeral=True)
+@bot.slash_command(name="ping", description="Check if the bot is alive.", guild_ids=GUILD_IDS or None)
+async def ping(ctx: discord.ApplicationContext) -> None:
+    await ctx.respond("Pong.", ephemeral=True)
 
 
-@bot.tree.command(
-    name="start",
+@bot.slash_command(
+    name="tt_start",
     description="Start live transcription in your current voice channel.",
+    guild_ids=GUILD_IDS or None,
 )
-async def start_command(interaction: discord.Interaction) -> None:
-    guild = interaction.guild
-    user = interaction.user
+async def start_command(ctx: discord.ApplicationContext) -> None:
+    guild = ctx.guild
+    user = ctx.author
 
     if guild is None or not isinstance(user, discord.Member):
-        await interaction.response.send_message(
-            "This command can only be used in a server.", ephemeral=True
-        )
+        await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
     if not user.voice or not user.voice.channel:
-        await interaction.response.send_message(
-            "You must be in a voice channel to start transcription.", ephemeral=True
-        )
+        await ctx.respond("You must be in a voice channel to start transcription.", ephemeral=True)
         return
 
     existing = voice_sessions.get(guild.id)
     if existing and existing.active and existing.voice_client.is_connected():
-        await interaction.response.send_message(
-            "Transcription is already active in this server.", ephemeral=True
-        )
+        await ctx.respond("Transcription is already active in this server.", ephemeral=True)
         return
 
     voice_channel = user.voice.channel
-    text_channel = interaction.channel
+    text_channel = ctx.channel
 
     if not isinstance(text_channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "This command must be used in a text channel.", ephemeral=True
-        )
+        await ctx.respond("This command must be used in a text channel.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=False)
+    await ctx.defer()
 
     try:
         voice_client = await voice_channel.connect()
     except discord.ClientException:
         voice_client = discord.utils.get(bot.voice_clients, guild=guild)
         if voice_client is None:
-            await interaction.followup.send("Failed to connect to the voice channel.")
+            await ctx.followup.send("Failed to connect to the voice channel.")
             return
 
-    sink = discord.sinks.WaveSink()
-
-    def finished_callback(sink: discord.sinks.Sink, *args) -> None:
-        bot.loop.create_task(handle_recording_finished(guild.id, sink))
-
-    voice_client.start_recording(sink, finished_callback, None)
+    sink = ChunkedWaveSink()
 
     session = VoiceSession(
         guild_id=guild.id,
@@ -508,68 +592,73 @@ async def start_command(interaction: discord.Interaction) -> None:
         text_channel_id=text_channel.id,
         started_by_id=user.id,
     )
+
+    def finished_callback(sink: discord.sinks.Sink, *args) -> None:
+        bot.loop.create_task(handle_recording_finished(guild.id, sink))
+
+    voice_client.start_recording(sink, finished_callback, None)
+
+    session.chunk_task = bot.loop.create_task(
+        periodic_transcription(guild.id, sink, session.stop_event)
+    )
     voice_sessions.add(session)
 
-    await interaction.followup.send(
+    await ctx.followup.send(
         f"Started transcription in {voice_channel.mention}. "
-        "Use `/stop` to end and post the transcript."
+        "Use `/tt_stop` to end and post the transcript."
     )
 
 
-@bot.tree.command(
-    name="stop",
+@bot.slash_command(
+    name="tt_stop",
     description="Stop the current transcription and post the transcript.",
+    guild_ids=GUILD_IDS or None,
 )
-async def stop_command(interaction: discord.Interaction) -> None:
-    guild = interaction.guild
+async def stop_command(ctx: discord.ApplicationContext) -> None:
+    guild = ctx.guild
     if guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.", ephemeral=True
-        )
+        await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
     session = voice_sessions.get(guild.id)
     if not session or not session.active:
-        await interaction.response.send_message(
-            "No active transcription in this server.", ephemeral=True
-        )
+        await ctx.respond("No active transcription in this server.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=False)
+    await ctx.defer()
 
     vc = session.voice_client
     if vc and vc.is_connected():
+        session.voice_channel_name = vc.channel.name if vc.channel else "unknown"
         vc.stop_recording()  # triggers finished_callback
+        await vc.disconnect()
 
     voice_sessions.stop(guild.id)
 
-    await interaction.followup.send(
+    await ctx.followup.send(
         "Stopping transcription. I will post the transcript here when it is ready."
     )
 
 
-@bot.tree.command(
+@bot.slash_command(
     name="status",
     description="Show the status of the current transcription session.",
+    guild_ids=GUILD_IDS or None,
 )
-async def status_command(interaction: discord.Interaction) -> None:
-    guild = interaction.guild
+async def status_command(ctx: discord.ApplicationContext) -> None:
+    guild = ctx.guild
     if guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.", ephemeral=True
-        )
+        await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
     session = voice_sessions.get(guild.id)
     if not session or not session.active:
-        await interaction.response.send_message(
-            "No active transcription session in this server.", ephemeral=True
-        )
+        await ctx.respond("No active transcription session in this server.", ephemeral=True)
         return
 
     vc = session.voice_client
     vc_name = vc.channel.name if vc and vc.channel else "unknown"
-    started_at_str = session.started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    started_at_str = session.started_at.strftime("%Y-%m-%d %H:%M:%S %Z")
     msg = (
         f"Transcription is active.\n"
         f"Voice channel: **{vc_name}**\n"
@@ -577,38 +666,33 @@ async def status_command(interaction: discord.Interaction) -> None:
         f"Started by: <@{session.started_by_id}>\n"
         f"Started at: {started_at_str}"
     )
-    await interaction.response.send_message(msg, ephemeral=True)
+    await ctx.respond(msg, ephemeral=True)
 
 
-@bot.tree.command(
+@bot.slash_command(
     name="set_character",
     description="Associate a Discord user with a character name for transcripts.",
-)
-@app_commands.describe(
-    character_name="The character name to associate with this user.",
-    user="The Discord user to set the character for (defaults to yourself).",
+    guild_ids=GUILD_IDS or None,
 )
 async def set_character_command(
-    interaction: discord.Interaction,
-    character_name: str,
-    user: Optional[discord.Member] = None,
+    ctx: discord.ApplicationContext,
+    character_name: discord.Option(str, "The character name to associate with this user."),
+    user: discord.Option(discord.Member, "The Discord user to set the character for (defaults to yourself).", required=False) = None,
 ) -> None:
-    guild = interaction.guild
+    guild = ctx.guild
     if guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.", ephemeral=True
-        )
+        await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
-    target = user or interaction.user
+    target = user or ctx.author
     session_manager.set_character(guild.id, target.id, character_name)
 
-    if target.id == interaction.user.id:
+    if target.id == ctx.author.id:
         msg = f"Set your character name to: **{character_name}**"
     else:
         msg = f"Set character name for {target.mention} to: **{character_name}**"
 
-    await interaction.response.send_message(msg, ephemeral=True)
+    await ctx.respond(msg, ephemeral=True)
 
 # -------------------------------------------------
 # Prefix command: manual guild sync
@@ -624,9 +708,8 @@ async def sync_guild(ctx: commands.Context) -> None:
 
     logger.info("Manually syncing commands for guild %d.", guild.id)
     try:
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        await ctx.send(f"Synced {len(synced)} commands to this guild.")
+        await bot.sync_commands(guild_ids=[guild.id])
+        await ctx.send("Synced commands to this guild.")
     except Exception as exc:
         logger.exception("Manual sync failed for guild %d: %s", guild.id, exc)
         await ctx.send(f"Sync failed: {exc!r}")

@@ -4,7 +4,6 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-"discord.py" = "*"
 python-dotenv = "*"
 py-cord = {extras = ["voice"], version = "*"}
 faster-whisper = "*"
